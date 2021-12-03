@@ -55,7 +55,7 @@ class ImagePyramide(torch.nn.Module):
     """
     Create image pyramide for computing pyramide perceptual loss. See Sec 3.3
     """
-    def __init__(self, scales, crop, num_channels):
+    def __init__(self, scales, num_channels, crop=False):
         super(ImagePyramide, self).__init__()
         downs = {}
         for scale in scales:
@@ -66,7 +66,7 @@ class ImagePyramide(torch.nn.Module):
             self.resize = transforms.Resize((128, 128))
             self.fa = face_alignment.FaceAlignment(face_alignment.LandmarksType._2D, device='cuda:0')
 
-    def get_face_crop(self, x):        
+    def get_face_crop(self, x):
         landmarks = self.fa.get_landmarks_from_batch((x * 255).to(x.device))
         
         res = []
@@ -79,7 +79,6 @@ class ImagePyramide(torch.nn.Module):
                 y_min, y_max = torch.clamp(torch.tensor([y_min, y_max]), 0, x.shape[-2])
                 crop = x[i][:, y_min: y_max, x_min: x_max]
                 crop = self.resize(crop)
-#                 import pdb; pdb.set_trace()
             else:
                 crop = self.resize(x[i])
             
@@ -89,11 +88,11 @@ class ImagePyramide(torch.nn.Module):
         
     def forward(self, x):
         out_dict = {}
+        if self.crop:
+            x = self.get_face_crop(x).to(x.device)
         for scale, down_module in self.downs.items():
             out_dict['prediction_' + str(scale).replace('-', '.')] = down_module(x)
-        if self.crop:
-            out_dict['prediction_crop'] = self.get_face_crop(x)
-
+        
         return out_dict
 
 
@@ -167,9 +166,14 @@ class GeneratorFullModel(torch.nn.Module):
         self.scales = train_params['scales']
         self.crop = train_params['crop']
         self.disc_scales = self.discriminator.scales
-        self.pyramid = ImagePyramide(self.scales, self.crop, generator.num_channels)
+        self.pyramid = ImagePyramide(self.scales, generator.num_channels)
+        if self.crop:
+            self.crop_pyramid = ImagePyramide(self.scales, generator.num_channels, self.crop)
+        
         if torch.cuda.is_available():
             self.pyramid = self.pyramid.cuda()
+            if self.crop:
+                self.crop_pyramid = self.crop_pyramid.cuda()
 
         self.loss_weights = train_params['loss_weights']
 
@@ -189,20 +193,29 @@ class GeneratorFullModel(torch.nn.Module):
 
         pyramide_real = self.pyramid(x['driving'])
         pyramide_generated = self.pyramid(generated['prediction'])
-
+        if self.crop:
+            crop_pyramide_real = self.crop_pyramid(x['driving'])
+            crop_pyramide_generated = self.crop_pyramid(generated['prediction'])
+            
         if sum(self.loss_weights['perceptual']) != 0:
             value_total = 0
-            if self.crop:
-                gen_scales = self.scales + ['crop']
-            else:
-                gen_scales = self.scales
-            for scale in gen_scales:
+            for scale in self.scales:
                 x_vgg = self.vgg(pyramide_generated['prediction_' + str(scale)])
                 y_vgg = self.vgg(pyramide_real['prediction_' + str(scale)])
 
                 for i, weight in enumerate(self.loss_weights['perceptual']):
                     value = torch.abs(x_vgg[i] - y_vgg[i].detach()).mean()
                     value_total += self.loss_weights['perceptual'][i] * value
+
+            if self.crop:
+                for scale in self.scales:
+                    crop_x_vgg = self.vgg(crop_pyramide_generated['prediction_' + str(scale)])
+                    crop_y_vgg = self.vgg(crop_pyramide_real['prediction_' + str(scale)])
+
+                    for i, weight in enumerate(self.loss_weights['perceptual']):
+                        value = torch.abs(crop_x_vgg[i] - crop_y_vgg[i].detach()).mean()
+                        value_total += self.loss_weights['perceptual'][i] * value
+                    
             loss_values['perceptual'] = value_total
 
         if self.loss_weights['generator_gan'] != 0:
